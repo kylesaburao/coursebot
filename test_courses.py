@@ -168,3 +168,35 @@ async def test_ambiguity_no_results_and_validation():
     cog.request.return_value = []
     with pytest.raises(CourseError, match='No matching'):
         await cog.course.callback(cog, context(), 'cmpt', '101')
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('slash', [False, True])
+async def test_input_errors_reach_user_through_command_dispatch(slash):
+    import discord
+    from discord.ext import commands
+    from unittest.mock import Mock
+    async with commands.Bot(command_prefix='!', intents=discord.Intents.none()) as client:
+        cog = Courses(None)
+        await client.add_cog(cog)
+        ctx = context()
+        ctx.bot = client
+        ctx.command = cog.course
+        ctx.prefix = '/' if slash else '!'
+        ctx.command_failed = False
+        ctx.kwargs = {'subject': 'bad&query', 'course_number': '101'}
+        cog.course.prepare = AsyncMock()
+        client.dispatch = Mock()
+        if slash:
+            client.get_context = AsyncMock(return_value=ctx)
+            interaction = Mock(client=client)
+            await cog.course.app_command._invoke_with_namespace(interaction, Mock())
+        else:
+            ctx.args = [cog, ctx]
+            try:
+                await cog.course.invoke(ctx)
+            except commands.CommandError as error:
+                await cog.course.dispatch_error(ctx, error)
+        assert ctx.command_failed
+        assert 'department code' in ctx.send.call_args.args[0]
+        ctx.defer.assert_not_awaited()

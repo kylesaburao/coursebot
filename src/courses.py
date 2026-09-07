@@ -13,7 +13,7 @@ from discord.ext import commands
 log = logging.getLogger(__name__)
 
 
-class CourseError(Exception):
+class CourseError(commands.CommandError):
     """An expected input or service error suitable for the user."""
 
 
@@ -109,7 +109,7 @@ class Courses(commands.Cog):
         if isinstance(original, CourseError):
             log.warning('Course command failed: %s', original)
             await ctx.send(str(original))
-        elif isinstance(error, commands.UserInputError):
+        elif isinstance(original, (commands.UserInputError, discord.app_commands.TransformerError)):
             await ctx.send(f'Check the arguments. Usage: {ctx.prefix}{ctx.command.name} {ctx.command.signature}. Quote names containing spaces in prefix commands.')
         else:
             log.error('Unexpected course command failure', exc_info=(type(original), original, original.__traceback__))
