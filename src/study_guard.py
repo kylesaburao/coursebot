@@ -1,284 +1,196 @@
-import os
+"""In-memory Study Time eligibility and role reconciliation."""
+import asyncio
+from contextlib import suppress
+from dataclasses import dataclass
+import logging
+import math
+from time import monotonic
+
 import discord
-from discord.ext import tasks
-from collections import defaultdict
-from datetime import datetime, timezone, timedelta
-from dotenv import load_dotenv
+from discord.ext import commands, tasks
 
-is_study_guard_initialized = False
-
-load_dotenv()
+log = logging.getLogger(__name__)
 
 
-def load_config() -> dict:
-  """
-  SETUP:
-  - Add custom role for STUDY_TIME_ROLE_NAME
-  - Ensure bot role is above STUDY_TIME_ROLE_NAME
-  """
-  guild_id = int(os.getenv("GUILD_ID", "0"))
-  vc_channel_id = int(os.getenv("STUDY_TIME_VC_CHANNEL_ID", "0"))
-  moderation_channel_id = int(os.environ.get("MODERATION_REPORT_VC_CHANNEL_ID", "0"))
-  role_name = os.getenv("STUDY_TIME_ROLE_NAME", "")
-
-  join_limit_count = int(os.getenv("STUDY_TIME_VC_JOIN_LIMIT_COUNT", "5"))
-  join_limit_window_s = int(os.getenv("STUDY_TIME_VC_JOIN_LIMIT_WINDOW_SECONDS", "60"))
-
-  # Short-stay abuse detection: if a user has STUDY_TIME_VC_SHORT_STAY_THRESHOLD or more
-  # visits shorter than STUDY_TIME_VC_SHORT_STAY_SECONDS within the tracking window,
-  # they are blocked from receiving the role.
-  short_stay_s = int(os.getenv("STUDY_TIME_VC_SHORT_STAY_SECONDS", "30"))
-  short_stay_threshold = int(os.getenv("STUDY_TIME_VC_SHORT_STAY_THRESHOLD", "5"))
-  short_stay_window_s = int(os.getenv("STUDY_TIME_VC_SHORT_STAY_WINDOW_SECONDS", "120"))
-  cleanup_interval_s = 600
-
-  if not all([vc_channel_id, role_name, moderation_channel_id, guild_id]):
-    raise RuntimeError("Invalid .env config")
-
-  non_zero_values = {
-    "STUDY_TIME_VC_JOIN_LIMIT_COUNT": join_limit_count,
-    "STUDY_TIME_VC_JOIN_LIMIT_WINDOW_SECONDS": join_limit_window_s,
-    "STUDY_TIME_VC_SHORT_STAY_SECONDS": short_stay_s,
-    "STUDY_TIME_VC_SHORT_STAY_THRESHOLD": short_stay_threshold,
-    "STUDY_TIME_VC_SHORT_STAY_WINDOW_SECONDS": short_stay_window_s,
-  }
-  for name, value in non_zero_values.items():
-    if value <= 0:
-      raise RuntimeError(f"Invalid .env config: {name} must be a positive integer, got {value}")
-
-  if short_stay_s >= short_stay_window_s:
-    raise RuntimeError(
-      f"Invalid .env config: STUDY_TIME_VC_SHORT_STAY_SECONDS ({short_stay_s}) "
-      f"must be less than STUDY_TIME_VC_SHORT_STAY_WINDOW_SECONDS ({short_stay_window_s})"
-    )
-
-  if join_limit_count >= join_limit_window_s:
-    raise RuntimeError(
-      f"Invalid .env config: STUDY_TIME_VC_JOIN_LIMIT_COUNT ({join_limit_count}) "
-      f"must be less than STUDY_TIME_VC_JOIN_LIMIT_WINDOW_SECONDS ({join_limit_window_s})"
-    )
-
-  return {
-    'STUDY_TIME_VC_CHANNEL_ID': vc_channel_id,
-    'MODERATION_REPORT_VC_CHANNEL_ID': moderation_channel_id,
-    'STUDY_TIME_ROLE_NAME': role_name,
-    'CLEANUP_INTERVAL_SECONDS': cleanup_interval_s,
-    'STUDY_TIME_VC_JOIN_LIMIT_COUNT': join_limit_count,
-    'STUDY_TIME_VC_JOIN_LIMIT_WINDOW_SECONDS': join_limit_window_s,
-    'STUDY_TIME_VC_JOIN_LIMIT_WINDOW_SECONDS_TIMEDELTA': timedelta(seconds=join_limit_window_s),
-    'STUDY_TIME_VC_SHORT_STAY_SECONDS': short_stay_s,
-    'STUDY_TIME_VC_SHORT_STAY_THRESHOLD_SECONDS': short_stay_threshold,
-    'STUDY_TIME_VC_SHORT_STAY_WINDOW_SECONDS': short_stay_window_s,
-    'STUDY_TIME_VC_SHORT_STAY_WINDOW_SECONDS_TIMEDELTA': timedelta(seconds=short_stay_window_s),
-    'GUILD_ID': guild_id
-  }
+@dataclass(frozen=True)
+class StudyGuardConfig:
+    guild_id: int
+    voice_channel_id: int
+    moderation_channel_id: int
+    role_name: str
+    join_limit_count: int = 5
+    join_window_seconds: int = 60
+    short_stay_seconds: int = 30
+    short_stay_threshold: int = 5
+    short_stay_window_seconds: int = 120
 
 
-def format_eta(seconds: int) -> str:
-  minutes, secs = divmod(seconds, 60)
-  return f"{minutes}m {secs}s" if minutes > 0 else f"{secs}s"
+def prune_timestamps(timestamps, window_start):
+    return [stamp for stamp in timestamps if stamp > window_start]
 
 
-def prune_timestamps(timestamps: list[datetime], window_start: datetime) -> list[datetime]:
-  return [t for t in timestamps if t > window_start]
+def wait_seconds(history, count, window, now):
+    current = prune_timestamps(history, now - window)
+    return max(0, current[-count] + window - now) if len(current) >= count else 0
 
 
-async def send_dm(member: discord.Member, message: str):
-  try:
-    await member.send(message)
-  except:
-    # Gracefully fail
-    print(f'Encountered error sending message to user "{member.name}"')
+class StudyGuard(commands.Cog):
+    def __init__(self, bot, config):
+        self.bot = bot
+        self.config = config
+        self.join_history = {}
+        self.short_stay_history = {}
+        # None denotes a startup occupant with unknown arrival time.
+        self.active_visits = {}
+        self.denied_visits = set()
+        self.lock = asyncio.Lock()
+        self.role = self.channel = self.report_channel = None
 
+    def prune(self, now):
+        for history, window in ((self.join_history, self.config.join_window_seconds), (self.short_stay_history, self.config.short_stay_window_seconds)):
+            for user_id, stamps in list(history.items()):
+                remaining = prune_timestamps(stamps, now - window)
+                if remaining:
+                    history[user_id] = remaining
+                else:
+                    del history[user_id]
 
-async def send_channel_message(client: discord.Client, channelId: int, message: str):
-  channel = client.get_channel(channelId)
-  if channel and type(channel) == discord.TextChannel:
-    await channel.send(f'[STUDY TIME] {message}')
-  else:
-    print(f'Failed to send message to channel {channelId}')
+    def join(self, user_id, now):
+        self.prune(now)
+        wait = math.ceil(max(
+            wait_seconds(self.join_history.get(user_id, []), self.config.join_limit_count, self.config.join_window_seconds, now),
+            wait_seconds(self.short_stay_history.get(user_id, []), self.config.short_stay_threshold, self.config.short_stay_window_seconds, now),
+        ))
+        if user_id in self.denied_visits:
+            return wait
+        if wait:
+            self.denied_visits.add(user_id)
+        else:
+            self.join_history.setdefault(user_id, []).append(now)
+            self.active_visits[user_id] = now
+        return wait
 
+    def leave(self, user_id, now):
+        arrival = self.active_visits.pop(user_id, None)
+        self.denied_visits.discard(user_id)
+        self.prune(now)
+        if arrival is not None and now - arrival < self.config.short_stay_seconds:
+            self.short_stay_history.setdefault(user_id, []).append(now)
 
-def setup(bot: discord.Client, config):
-  global is_study_guard_initialized
-  if is_study_guard_initialized:
-    raise RuntimeError('This has already been called')
-  is_study_guard_initialized = True
-  
-  guild_id = config['GUILD_ID']
-  vc_channel_id = config['STUDY_TIME_VC_CHANNEL_ID']
-  moderation_channel_id = config['MODERATION_REPORT_VC_CHANNEL_ID']
-  role_name = config['STUDY_TIME_ROLE_NAME']
-  join_limit_count = config['STUDY_TIME_VC_JOIN_LIMIT_COUNT']
-  join_limit_window_s = config['STUDY_TIME_VC_JOIN_LIMIT_WINDOW_SECONDS']
-  join_limit_window_td = config['STUDY_TIME_VC_JOIN_LIMIT_WINDOW_SECONDS_TIMEDELTA']
-  short_stay_s = config['STUDY_TIME_VC_SHORT_STAY_SECONDS']
-  short_stay_threshold = config['STUDY_TIME_VC_SHORT_STAY_THRESHOLD_SECONDS']
-  short_stay_window_s = config['STUDY_TIME_VC_SHORT_STAY_WINDOW_SECONDS']
-  short_stay_window_td = config['STUDY_TIME_VC_SHORT_STAY_WINDOW_SECONDS_TIMEDELTA']
-  cleanup_interval_s = config['CLEANUP_INTERVAL_SECONDS']
-  
-  join_history: dict[int, list[datetime]] = defaultdict(list)
-  short_stay_history: dict[int, list[datetime]] = defaultdict(list)
-  user_joined_at: dict[int, datetime] = {}
-  study_time_role = None
+    def resolve(self):
+        guild = self.bot.get_guild(self.config.guild_id)
+        self.role = self.channel = self.report_channel = None
+        if guild is None or guild.unavailable:
+            log.warning('Study Guard guild %s unavailable', self.config.guild_id)
+            return None
+        channel = guild.get_channel(self.config.voice_channel_id)
+        role = discord.utils.get(guild.roles, name=self.config.role_name)
+        report = guild.get_channel(self.config.moderation_channel_id)
+        if isinstance(report, discord.TextChannel) and guild.me and report.permissions_for(guild.me).send_messages and report.permissions_for(guild.me).view_channel:
+            self.report_channel = report
+        else:
+            log.warning('Study Guard report channel %s unavailable or not writable', self.config.moderation_channel_id)
+        if not isinstance(channel, discord.VoiceChannel):
+            log.warning('Study Guard voice channel %s unavailable', self.config.voice_channel_id)
+            return guild
+        self.channel = channel
+        if not role or not guild.me or not guild.me.guild_permissions.manage_roles or not role.is_assignable():
+            log.warning('Study Guard role %s unavailable or not assignable', self.config.role_name)
+            return guild
+        self.role = role
+        return guild
 
-
-  @tasks.loop(seconds=cleanup_interval_s)
-  async def cleanup_stale_history():
-    # Avoid DoS or other weird stuff
-
-    now = datetime.now(timezone.utc)
-
-    join_window_start = now - join_limit_window_td
-    short_stay_window_start = now - short_stay_window_td
-
-    for user_id in list(join_history.keys()):
-      join_history[user_id] = prune_timestamps(join_history[user_id], join_window_start)
-      if not join_history[user_id]:
-        del join_history[user_id]
-
-    for user_id in list(short_stay_history.keys()):
-      short_stay_history[user_id] = prune_timestamps(short_stay_history[user_id], short_stay_window_start)
-      if not short_stay_history[user_id]:
-        del short_stay_history[user_id]
-
-    # Clean up user_joined_at entries older than the largest window
-    stale_threshold = now - timedelta(seconds=max(join_limit_window_s, short_stay_window_s))
-    for user_id in list(user_joined_at.keys()):
-      if user_joined_at[user_id] < stale_threshold:
-        del user_joined_at[user_id]
-
-
-  async def on_ready(bot: discord.Client):
-    nonlocal study_time_role
-
-    if not cleanup_stale_history.is_running():
-      cleanup_stale_history.start()
-
-    guild = bot.get_guild(guild_id)
-    study_time_vc = bot.get_channel(vc_channel_id)
-
-    if guild and study_time_vc and type(study_time_vc) is discord.VoiceChannel:
-      study_time_role = discord.utils.get(guild.roles, name=role_name)
-      if not study_time_role:
-        raise RuntimeError('Could not locate Study Time role')
-
-      # Auto clear study time roles
-      removed_roles = 0
-      for member in guild.members:
+    async def change_role(self, member, eligible):
+        if self.role is None:
+            return False
         try:
-          # only remove the study time role if they have the role and aren't currently in the Voice Channel
-          if member.get_role(study_time_role.id) and member not in study_time_vc.members:
-            removed_roles += 1
-            await member.remove_roles(study_time_role)
-        except Exception as e:
-          print(e)
+            if eligible:
+                await member.add_roles(self.role, reason='Study Time eligibility')
+            else:
+                await member.remove_roles(self.role, reason='Study Time eligibility')
+            return True
+        except discord.HTTPException:
+            log.warning('Study Guard role change failed for %s', member.id, exc_info=True)
+            return False
 
-      # Auto assign role to all members in the VC
-      added_roles = 0
-      for member in study_time_vc.members:
+    async def notify(self, member, wait):
+        message = f'Please wait {wait}s, then leave and rejoin Study Time to receive the chat role.'
         try:
-          # if the member already has the role, we can save API calls
-          if not member.get_role(study_time_role.id):
-            added_roles += 1
-            await member.add_roles(study_time_role)
-        except Exception as e:
-          print(e)
-      
-      await send_channel_message(
-        bot,
-        moderation_channel_id,
-        f'Done initializing for Study Time. Auto assigned {study_time_role} role to {added_roles} members and removed from {removed_roles} other members.'
-      )
-        
-    else:
-      raise RuntimeError('Cannot initialize Study Time bot')
-    
+            await member.send(message)
+        except discord.HTTPException:
+            log.warning('Study Guard DM failed for %s', member.id)
+        if self.report_channel:
+            try:
+                await self.report_channel.send(f'[STUDY TIME] {member.id} denied: {message}')
+            except discord.HTTPException:
+                log.warning('Study Guard report failed for %s', member.id)
 
-  @bot.event
-  async def on_voice_state_update(
-    member: discord.Member,
-    before: discord.VoiceState,
-    after: discord.VoiceState,
-  ):
-    if not study_time_role:
-      raise RuntimeError('Study Time Role is missing. Initialization failed')
+    @commands.Cog.listener()
+    async def on_voice_state_update(self, member, before, after):
+        now = monotonic()
+        if member.guild.id != self.config.guild_id:
+            return
+        old = before.channel.id if before.channel else None
+        new = after.channel.id if after.channel else None
+        channel_id = self.config.voice_channel_id
+        if old == new or channel_id not in (old, new):
+            return
+        await self.bot.wait_until_ready()
+        wait = 0
+        async with self.lock:
+            self.resolve()
+            if new == channel_id:
+                wait = self.join(member.id, now)
+                await self.change_role(member, member.id not in self.denied_visits)
+            else:
+                self.leave(member.id, now)
+                # Always issue transitions, even when the gateway role cache lags.
+                await self.change_role(member, False)
+        if wait:
+            await self.notify(member, wait)
 
-    now = datetime.now(timezone.utc)
-    await bot.wait_until_ready()
+    async def reconcile(self):
+        async with self.lock:
+            now = monotonic()
+            self.prune(now)
+            guild = self.resolve()
+            if guild is None or self.channel is None:
+                return
+            members = {member.id: member for member in guild.members}
+            occupants = {member.id for member in self.channel.members}
+            for history in (self.join_history, self.short_stay_history, self.active_visits):
+                for user_id in list(history):
+                    if user_id not in members:
+                        del history[user_id]
+            self.denied_visits.intersection_update(members)
+            for user_id in set(self.active_visits) | self.denied_visits:
+                if user_id not in occupants:
+                    # No departure timestamp was observed while disconnected.
+                    self.active_visits.pop(user_id, None)
+                    self.denied_visits.discard(user_id)
+            for user_id in occupants - self.denied_visits:
+                self.active_visits.setdefault(user_id, None)
+            added = removed = 0
+            if self.role:
+                for member in members.values():
+                    eligible = member.id in occupants and member.id not in self.denied_visits
+                    if bool(member.get_role(self.role.id)) != eligible:
+                        if await self.change_role(member, eligible):
+                            added += int(eligible)
+                            removed += int(not eligible)
+            log.info('Study Guard reconciliation: added=%s removed=%s', added, removed)
 
-    new_channel_id = after.channel.id if after.channel else None
-    old_channel_id = before.channel.id if before.channel else None
-    is_joined = new_channel_id == vc_channel_id and old_channel_id != vc_channel_id
-    is_left = old_channel_id == vc_channel_id and new_channel_id != vc_channel_id
-    new_channel_name = after.channel.name if after.channel else None
+    @tasks.loop(seconds=600)
+    async def maintenance(self):
+        await self.reconcile()
 
-    try:
-      if is_joined:
+    @maintenance.before_loop
+    async def before_maintenance(self):
+        await self.bot.wait_until_ready()
 
-        # Prune join history and check frequency limit
-        join_history[member.id] = prune_timestamps(
-          join_history[member.id], now - join_limit_window_td
-        )
-
-        # Check join frequency limit before recording this join (AVOID DoS)
-        if len(join_history[member.id]) >= join_limit_count:
-          oldest = join_history[member.id][0]
-          remaining = max(1, int((oldest + join_limit_window_td - now).total_seconds()))
-          moderation_message = f"{member.name} ({member.id}) exceeded join limit with timeout {format_eta(remaining)} ({join_limit_count} in {format_eta(join_limit_window_s)} to {new_channel_name})"
-
-          await send_dm(
-            member,
-            f"You are joining Study Time too frequently. "
-            f"Please wait {format_eta(remaining)} before rejoining to have access to the chat.",
-          )
-          await send_channel_message(bot, moderation_channel_id, moderation_message)
-          return
-
-        join_history[member.id].append(now)
-
-        # Check short-stay abuse
-        short_stay_history[member.id] = prune_timestamps(
-          short_stay_history[member.id], now - short_stay_window_td
-        )
-        if len(short_stay_history[member.id]) >= short_stay_threshold:
-          oldest = short_stay_history[member.id][0]
-          remaining = max(1, int((oldest + short_stay_window_td - now).total_seconds()))
-          moderation_message = f"{member.name} ({member.id}) flagged for short-stay abuse with timeout {format_eta(remaining)} ({len(short_stay_history[member.id])} short visits to {new_channel_name})"
-
-          await send_dm(
-            member,
-            f"You have been joining Study Time for very short periods too often. "
-            f"Please wait {format_eta(remaining)} before rejoining to have access to the chat.",
-          )
-          await send_channel_message(bot, moderation_channel_id, moderation_message)
-          return
-
-        user_joined_at[member.id] = now
-        try:
-          await member.add_roles(study_time_role)
-        except Exception as e:
-          await send_channel_message(bot, moderation_channel_id, f"[ERROR] Failed to add role {study_time_role.name} to {member.name} ({member.id}): {e}")
-
-      elif is_left:
-        # Record short stay if applicable
-        join_time = user_joined_at.pop(member.id, None)
-        short_stay_duration = (now - join_time).total_seconds() if join_time is not None else None
-        if (short_stay_duration is not None) and (short_stay_duration < short_stay_s):
-          short_stay_history[member.id] = prune_timestamps(
-            short_stay_history[member.id], now - short_stay_window_td
-          )
-          short_stay_history[member.id].append(now)
-
-        try:
-          await member.remove_roles(study_time_role)
-        except Exception as e:
-          await send_channel_message(bot, moderation_channel_id, f"[ERROR] Failed to remove role ${study_time_role.name} from {member.name} ({member.id}): {e}")
-    except Exception as error:
-      await send_channel_message(bot, moderation_channel_id, f"[ERROR] An error occurred while processing role change: {error}")
-
-
-  return {
-    'on_ready': on_ready
-  }
+    async def stop(self):
+        task = self.maintenance.get_task()
+        self.maintenance.cancel()
+        if task:
+            with suppress(asyncio.CancelledError):
+                await task
