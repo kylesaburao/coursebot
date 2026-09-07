@@ -168,6 +168,11 @@ class StudyGuard(commands.Cog):
                 return
             members = {member.id: member for member in guild.members}
             occupants = {member.id for member in self.channel.members}
+            # Let queued listeners register before cleanup, retaining these snapshots
+            # so subsequent cache changes cannot alter the captured occupancy.
+            await asyncio.sleep(0)
+            if self.pending_voice_events:
+                return
             for history in (self.join_history, self.short_stay_history, self.active_visits):
                 for user_id in list(history):
                     if user_id not in members:

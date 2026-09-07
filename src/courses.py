@@ -137,7 +137,7 @@ class Courses(commands.Cog):
         if not name:
             raise CourseError('Enter an instructor name.')
         await ctx.defer()
-        data = records(await self.request('/v1/rest/instructors', {'name': name}))
+        data = records(await self.request('/v1/rest/instructors', {'name': instructor_name.strip()}))
         exact = [item for item in data if normalized(value(item, 'name')).casefold() == name.casefold()]
         data = exact or data
         if not data:

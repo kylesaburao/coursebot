@@ -15,13 +15,13 @@ Use either `/` application commands or the `!` prefix. Quote arguments containin
 
 ```text
 !course CMPT 105W
-!offerings "Brian Fraser" "2025-fall"
+!offerings "Brian Fraser" "Fall 2025"
 !offerings "Brian Fraser" summer
 !section 2026 spring CMPT 120
 !reviews "Brian Fraser"
 ```
 
-Departments and section terms are case-insensitive. Section terms must be `spring`, `summer`, or `fall`, with a four-digit year. Course numbers may include letters, such as `105W`. Term filters match the API's year-season text, such as `2025-fall`, `2025`, or `fall`. Leading, trailing, and repeated whitespace is normalized for names and filters. Long lists span consecutive embeds. Unusually long individual values are explicitly marked as truncated.
+Departments and section terms are case-insensitive. Section terms must be `spring`, `summer`, or `fall`, with a four-digit year. Course numbers may include letters, such as `105W`. Instructor offerings contain season-year terms such as `Fall 2025`. Term filters match substrings, such as `Fall 2025`, `2025`, or `fall`, case-insensitively. Offerings queries trim leading and trailing whitespace but preserve internal whitespace in instructor names. Name matching, reviews queries, and term filters still normalize leading, trailing, and repeated whitespace. Long lists span consecutive embeds. Unusually long individual values are explicitly marked as truncated.
 
 ## Startup
 

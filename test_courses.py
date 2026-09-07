@@ -49,15 +49,33 @@ async def test_section_real_shape_and_encoded_query():
 
 
 @pytest.mark.asyncio
-async def test_offerings_exact_match_filter_and_chronology():
+@pytest.mark.parametrize('term,expected', [
+    (' Fall 2025 ', ['Fall 2025']),
+    (' 2025 ', ['Fall 2025', 'Summer 2025', 'Spring 2025']),
+    (' fall ', ['Fall 2025', 'Fall 2024']),
+])
+async def test_offerings_exact_match_filter_and_chronology(term, expected):
     cog = Courses(None)
-    rows = [{'dept': 'CMPT', 'number': '105W', 'title': 'Test', 'term': term} for term in ['2025-spring', '2024-fall', '2025-fall', '2025-summer']]
+    rows = [{'dept': 'CMPT', 'number': '105W', 'title': 'Test', 'term': term} for term in ['Spring 2025', 'Fall 2024', 'Fall 2025', 'Summer 2025']]
     cog.request = AsyncMock(return_value=[{'name': 'Jane Doe Jr'}, {'name': 'Jane Doe', 'offerings': rows}])
     ctx = context()
-    await cog.offerings.callback(cog, ctx, '  jANE   doE ', ' 2025 ')
-    assert [output(ctx).index(term) for term in ['2025-fall', '2025-summer', '2025-spring']] == sorted(output(ctx).index(term) for term in ['2025-fall', '2025-summer', '2025-spring'])
-    assert '2024' not in output(ctx)
-    cog.request.assert_awaited_with('/v1/rest/instructors', {'name': 'jANE doE'})
+    await cog.offerings.callback(cog, ctx, '  jANE   doE ', term)
+    assert output(ctx).splitlines() == [f'CMPT 105W: Test ({term})' for term in expected]
+    cog.request.assert_awaited_with('/v1/rest/instructors', {'name': 'jANE   doE'})
+
+
+@pytest.mark.asyncio
+async def test_offerings_request_preserves_internal_whitespace():
+    async def handler(request):
+        assert request.path == '/v1/rest/instructors'
+        assert dict(request.query) == {'name': 'Eva  Mackamul'}
+        return web.json_response([{'name': 'Eva  Mackamul', 'offerings': [
+            {'dept': 'CMPT', 'number': '120', 'title': 'Test', 'term': 'Fall 2025'}]}])
+    async with server(handler) as url, aiohttp.ClientSession() as session:
+        cog = Courses(session, url)
+        ctx = context()
+        await cog.offerings.callback(cog, ctx, '  Eva  Mackamul  ')
+    assert output(ctx) == 'CMPT 120: Test (Fall 2025)'
 
 
 @pytest.mark.asyncio

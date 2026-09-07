@@ -88,6 +88,76 @@ async def test_fifth_short_stay_survives_reconciliation(race):
 
 
 @pytest.mark.asyncio
+async def test_departure_before_reconciliation_snapshot_preserves_short_stay():
+    guard, member, channel, _ = fixture()
+    guard.join_history[10] = [10, 30, 50, 70]
+    guard.short_stay_history[10] = [11, 31, 51, 71]
+    adding, release, queued = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    loop = asyncio.get_running_loop()
+    departure = None
+    def gateway_departure():
+        nonlocal departure
+        channel.members = []
+        clock.return_value = 102
+        departure = asyncio.create_task(guard.on_voice_state_update(member, voice(channel), voice(None)))
+    async def add(*args, **kwargs):
+        adding.set()
+        await release.wait()
+        loop.call_soon(gateway_departure)
+    async def reconcile():
+        queued.set()
+        await guard.reconcile()
+    member.add_roles.side_effect = add
+    with patch('src.study_guard.monotonic', return_value=100) as clock:
+        channel.members = [member]
+        join = asyncio.create_task(guard.on_voice_state_update(member, voice(None), voice(channel)))
+        await adding.wait()
+        reconciliation = asyncio.create_task(reconcile())
+        await queued.wait()
+        release.set()
+        await asyncio.gather(join, reconciliation)
+        assert departure is not None
+        await departure
+        assert guard.short_stay_history[10] == [11, 31, 51, 71, 102]
+        clock.return_value = 103
+        channel.members = [member]
+        await guard.on_voice_state_update(member, voice(None), voice(channel))
+    assert 10 in guard.denied_visits and 10 not in guard.active_visits
+    member.add_roles.assert_awaited_once()
+    assert guard.pending_voice_events == 0
+
+
+@pytest.mark.asyncio
+async def test_departure_after_reconciliation_snapshot_preserves_short_stay():
+    guard, member, channel, _ = fixture()
+    guard.active_visits[10] = 100
+    guard.short_stay_history[10] = [11, 31, 51, 71]
+    channel.members = [member]
+    member.get_role.return_value = member.guild.roles[0]
+    loop = asyncio.get_running_loop()
+    departure = None
+    def gateway_departure():
+        nonlocal departure
+        channel.members = []
+        clock.return_value = 102
+        departure = asyncio.create_task(guard.on_voice_state_update(member, voice(channel), voice(None)))
+    resolve = guard.resolve
+    def resolve_then_depart():
+        guild = resolve()
+        loop.call_soon(gateway_departure)
+        return guild
+    with patch('src.study_guard.monotonic', return_value=102) as clock:
+        with patch.object(guard, 'resolve', side_effect=resolve_then_depart):
+            await guard.reconcile()
+        await asyncio.sleep(0)
+        assert departure is not None
+        await departure
+    assert guard.short_stay_history[10] == [11, 31, 51, 71, 102]
+    assert not guard.active_visits
+    assert guard.pending_voice_events == 0
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('waiting_for', ['readiness', 'lock'])
 async def test_cancelled_voice_event_allows_reconciliation(waiting_for):
     guard, member, channel, _ = fixture()
