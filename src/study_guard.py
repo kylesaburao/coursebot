@@ -93,6 +93,9 @@ class StudyGuard(commands.Cog):
         if not isinstance(channel, discord.VoiceChannel):
             log.warning('Study Guard voice channel %s unavailable', self.config.voice_channel_id)
             return guild
+        if not guild.me or not channel.permissions_for(guild.me).view_channel:
+            log.warning('Study Guard voice channel %s is not visible', self.config.voice_channel_id)
+            return guild
         self.channel = channel
         if not role or not guild.me or not guild.me.guild_permissions.manage_roles or not role.is_assignable():
             log.warning('Study Guard role %s unavailable or not assignable', self.config.role_name)

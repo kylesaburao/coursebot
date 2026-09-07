@@ -183,3 +183,21 @@ async def test_independent_instances_and_maintenance_stop():
     first.reconcile.assert_not_awaited()
     await first.stop()
     assert task.done() and task.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_unavailable_objects_preserve_state_and_retry():
+    guard, member, channel, report = fixture()
+    guard.join(10, 1)
+    member.guild.unavailable = True
+    await guard.reconcile()
+    assert guard.active_visits == {10: 1}
+    member.guild.unavailable = False
+    channel.permissions_for.return_value = SimpleNamespace(view_channel=False)
+    await guard.reconcile()
+    assert guard.channel is None and guard.active_visits == {10: 1}
+    channel.permissions_for.return_value = SimpleNamespace(view_channel=True)
+    channel.members = [member]
+    await guard.reconcile()
+    member.add_roles.assert_awaited_once()
+    assert guard.active_visits == {10: 1}
