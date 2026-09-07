@@ -42,6 +42,83 @@ def http_error():
     return discord.HTTPException(SimpleNamespace(status=500, reason='failure'), 'failure')
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize('race', [False, True])
+async def test_fifth_short_stay_survives_reconciliation(race):
+    guard, member, channel, _ = fixture()
+    guard.join_history[10] = [10, 30, 50, 70]
+    guard.short_stay_history[10] = [11, 31, 51, 71]
+    adding, release = asyncio.Event(), asyncio.Event()
+    queued, departing = asyncio.Event(), asyncio.Event()
+    async def add(*args, **kwargs):
+        adding.set()
+        await release.wait()
+    async def reconcile():
+        queued.set()
+        await guard.reconcile()
+    async def ready():
+        departing.set()
+    member.add_roles.side_effect = add
+    with patch('src.study_guard.monotonic', return_value=100) as clock:
+        channel.members = [member]
+        join = asyncio.create_task(guard.on_voice_state_update(member, voice(None), voice(channel)))
+        await adding.wait()
+        tasks = [join]
+        channel.members = []
+        if race:
+            tasks.append(asyncio.create_task(reconcile()))
+            await queued.wait()
+        clock.return_value = 102
+        guard.bot.wait_until_ready.side_effect = ready
+        tasks.append(asyncio.create_task(guard.on_voice_state_update(member, voice(channel), voice(None))))
+        await departing.wait()
+        pending = guard.pending_voice_events
+        release.set()
+        await asyncio.gather(*tasks)
+        assert pending == 2
+        assert guard.short_stay_history[10] == [11, 31, 51, 71, 102]
+        assert guard.pending_voice_events == 0
+        clock.return_value = 103
+        channel.members = [member]
+        await guard.on_voice_state_update(member, voice(None), voice(channel))
+    assert 10 in guard.denied_visits and 10 not in guard.active_visits
+    assert member.add_roles.await_count == 1
+    assert member.remove_roles.await_count == 2
+    member.send.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('waiting_for', ['readiness', 'lock'])
+async def test_cancelled_voice_event_allows_reconciliation(waiting_for):
+    guard, member, channel, _ = fixture()
+    guard.active_visits[10] = 100
+    guard.join_history[10] = [1]
+    entered, ready = asyncio.Event(), asyncio.Event()
+    async def wait_until_ready():
+        entered.set()
+        await ready.wait()
+    guard.bot.wait_until_ready.side_effect = wait_until_ready
+    if waiting_for == 'lock':
+        ready.set()
+        await guard.lock.acquire()
+    with patch('src.study_guard.monotonic', return_value=102):
+        event = asyncio.create_task(guard.on_voice_state_update(member, voice(channel), voice(None)))
+        await entered.wait()
+        try:
+            assert guard.pending_voice_events == 1
+        finally:
+            event.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await event
+            if waiting_for == 'lock':
+                guard.lock.release()
+        assert guard.pending_voice_events == 0
+        assert guard.active_visits == {10: 100}
+        await guard.reconcile()
+    assert not guard.active_visits and not guard.join_history
+    member.remove_roles.assert_not_awaited()
+
+
 def test_exact_windows_combined_wait_and_rejected_history():
     guard, member, _, _ = fixture()
     guard.config = replace(guard.config, join_limit_count=2, short_stay_threshold=2)

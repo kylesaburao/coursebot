@@ -43,6 +43,7 @@ class StudyGuard(commands.Cog):
         # None denotes a startup occupant with unknown arrival time.
         self.active_visits = {}
         self.denied_visits = set()
+        self.pending_voice_events = 0
         self.lock = asyncio.Lock()
         self.role = self.channel = self.report_channel = None
 
@@ -138,22 +139,28 @@ class StudyGuard(commands.Cog):
         channel_id = self.config.voice_channel_id
         if old == new or channel_id not in (old, new):
             return
-        await self.bot.wait_until_ready()
-        wait = 0
-        async with self.lock:
-            self.resolve()
-            if new == channel_id:
-                wait = self.join(member.id, now)
-                await self.change_role(member, member.id not in self.denied_visits)
-            else:
-                self.leave(member.id, now)
-                # Always issue transitions, even when the gateway role cache lags.
-                await self.change_role(member, False)
+        self.pending_voice_events += 1
+        try:
+            await self.bot.wait_until_ready()
+            wait = 0
+            async with self.lock:
+                self.resolve()
+                if new == channel_id:
+                    wait = self.join(member.id, now)
+                    await self.change_role(member, member.id not in self.denied_visits)
+                else:
+                    self.leave(member.id, now)
+                    # Always issue transitions, even when the gateway role cache lags.
+                    await self.change_role(member, False)
+        finally:
+            self.pending_voice_events -= 1
         if wait:
             await self.notify(member, wait)
 
     async def reconcile(self):
         async with self.lock:
+            if self.pending_voice_events:
+                return
             now = monotonic()
             self.prune(now)
             guild = self.resolve()
